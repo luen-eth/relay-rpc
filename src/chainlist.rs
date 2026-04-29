@@ -1,12 +1,11 @@
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
 use reqwest::Client;
-use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::Config,
+    config::ChainConfig,
     settings::SETTINGS,
     state::RelayState,
     types::{ChainlistNetwork, Endpoint},
@@ -16,7 +15,7 @@ use crate::{
 pub async fn refresh_chainlist(
     client: &Client,
     state: Arc<RwLock<RelayState>>,
-    config: &Config,
+    config: &ChainConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let networks = client
         .get(SETTINGS.chainlist_url)
@@ -62,21 +61,6 @@ pub async fn refresh_chainlist(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum CustomRpcFile {
-    Object(CustomRpcObject),
-    Array(Vec<Value>),
-}
-
-#[derive(Debug, Deserialize)]
-struct CustomRpcObject {
-    #[serde(rename = "chainId")]
-    chain_id: Option<u64>,
-    #[serde(default)]
-    rpc: Vec<Value>,
-}
-
 fn read_custom_rpc_urls(
     path: &Path,
     chain_id: u64,
@@ -93,26 +77,68 @@ fn read_custom_rpc_urls(
     }
 
     let content = fs::read_to_string(path)?;
-    let custom_rpc_file = serde_json::from_str::<CustomRpcFile>(&content)?;
-    let rpc_entries = match custom_rpc_file {
-        CustomRpcFile::Object(custom_rpc_object) => {
-            if let Some(custom_chain_id) = custom_rpc_object.chain_id {
-                if custom_chain_id != chain_id {
-                    println!(
-                        "[chainlist] {} ignored because chainId {} does not match CHAIN_ID {}",
-                        path.display(),
-                        custom_chain_id,
-                        chain_id
-                    );
-                    return Ok(Vec::new());
-                }
-            }
-            custom_rpc_object.rpc
-        }
-        CustomRpcFile::Array(rpc_entries) => rpc_entries,
-    };
+    let value = serde_json::from_str::<Value>(&content)?;
+    let rpc_entries = custom_rpc_entries_for_chain(value, chain_id);
 
     Ok(extract_http_urls(rpc_entries))
+}
+
+fn custom_rpc_entries_for_chain(value: Value, chain_id: u64) -> Vec<Value> {
+    match value {
+        Value::Object(map) => custom_rpc_entries_from_object(map, chain_id),
+        Value::Array(items) => {
+            let contains_chain_objects = items.iter().any(|item| {
+                item.as_object()
+                    .is_some_and(|map| map.contains_key("chainId") || map.contains_key("rpc"))
+            });
+
+            if contains_chain_objects {
+                items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        Value::Object(map) => {
+                            Some(custom_rpc_entries_from_chain_object(map, chain_id))
+                        }
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect()
+            } else {
+                items
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn custom_rpc_entries_from_object(mut map: Map<String, Value>, chain_id: u64) -> Vec<Value> {
+    if let Some(Value::Array(chains)) = map.remove("chains") {
+        return chains
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::Object(chain_map) => {
+                    Some(custom_rpc_entries_from_chain_object(chain_map, chain_id))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+    }
+
+    custom_rpc_entries_from_chain_object(map, chain_id)
+}
+
+fn custom_rpc_entries_from_chain_object(mut map: Map<String, Value>, chain_id: u64) -> Vec<Value> {
+    if let Some(custom_chain_id) = map.get("chainId").and_then(Value::as_u64) {
+        if custom_chain_id != chain_id {
+            return Vec::new();
+        }
+    }
+
+    match map.remove("rpc") {
+        Some(Value::Array(rpc_entries)) => rpc_entries,
+        _ => Vec::new(),
+    }
 }
 
 fn merge_urls(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {

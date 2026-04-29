@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::Config,
+    config::ChainConfig,
     rpc::rpc_call,
     settings::{historical_probe, DEFAULT_SPARSE_TOPIC, SETTINGS, ZERO_ADDRESS},
     state::RelayState,
@@ -14,11 +14,18 @@ use crate::{
     util::{now_iso, now_ms, rpc_error_message, to_hex},
 };
 
-pub async fn run_health_round(client: &Client, state: Arc<RwLock<RelayState>>, config: &Config) {
+pub async fn run_health_round(
+    client: &Client,
+    state: Arc<RwLock<RelayState>>,
+    config: &ChainConfig,
+) {
     {
         let mut state = state.write().await;
         if state.round_running {
-            println!("[health] previous round still running; skipping overlap");
+            println!(
+                "[health] chain {}: previous round still running; skipping overlap",
+                config.chain_id
+            );
             return;
         }
         state.round_running = true;
@@ -65,11 +72,12 @@ pub async fn run_health_round(client: &Client, state: Arc<RwLock<RelayState>>, c
     state.last_round_finished_at = Some(now_iso());
 
     println!(
-        "[health] round {round}: {healthy_count}/{total_count} healthy; reference block {reference_latest_block}"
+        "[health] chain {} round {round}: {healthy_count}/{total_count} healthy; reference block {reference_latest_block}",
+        config.chain_id
     );
 }
 
-async fn check_endpoint(client: &Client, url: String, config: &Config) -> HealthSnapshot {
+async fn check_endpoint(client: &Client, url: String, config: &ChainConfig) -> HealthSnapshot {
     let started = Instant::now();
     let checked_at_ms = now_ms();
     let mut reason = Vec::new();
@@ -158,7 +166,7 @@ async fn check_endpoint(client: &Client, url: String, config: &Config) -> Health
 async fn check_archive(
     client: &Client,
     url: &str,
-    config: &Config,
+    config: &ChainConfig,
     latest_block: Option<u64>,
 ) -> (bool, bool) {
     if let Some(probe) = historical_probe(config.chain_id) {

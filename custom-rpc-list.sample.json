@@ -1,9 +1,19 @@
 {
-  "chainId": 56,
-  "rpc": [
-    "https://your-first-archive-rpc.example",
+  "chains": [
     {
-      "url": "https://your-second-archive-rpc.example"
+      "chainId": 56,
+      "rpc": [
+        "https://your-bsc-archive-rpc.example",
+        {
+          "url": "https://your-second-bsc-archive-rpc.example"
+        }
+      ]
+    },
+    {
+      "chainId": 1,
+      "rpc": [
+        "https://your-ethereum-archive-rpc.example"
+      ]
     }
   ]
 }

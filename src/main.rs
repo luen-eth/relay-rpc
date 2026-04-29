@@ -10,15 +10,19 @@ mod state;
 mod types;
 mod util;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use reqwest::Client;
 use tokio::{net::TcpListener, sync::RwLock, time};
 use tracing::error;
 
 use crate::{
-    chainlist::refresh_chainlist, config::Config, health::run_health_round, server::app,
-    settings::SETTINGS, state::RelayState,
+    chainlist::refresh_chainlist,
+    config::{ChainConfig, Config},
+    health::run_health_round,
+    server::{app, ChainRuntime},
+    settings::SETTINGS,
+    state::RelayState,
 };
 
 #[tokio::main]
@@ -31,31 +35,67 @@ async fn main() -> anyhow_free::Result<()> {
         .init();
 
     let config = Config::load()?;
-    let state = Arc::new(RwLock::new(RelayState::new()));
     let client = Client::builder()
         .user_agent(SETTINGS.user_agent)
         .timeout(Duration::from_millis(SETTINGS.proxy_timeout_ms))
         .build()?;
 
-    refresh_chainlist(&client, state.clone(), &config).await?;
-    run_health_round(&client, state.clone(), &config).await;
-
-    spawn_chainlist_refresh(client.clone(), state.clone(), config.clone());
-    spawn_health_loop(client.clone(), state.clone(), config.clone());
+    let chains = initialize_chains(&client, &config).await?;
+    for runtime in chains.values() {
+        spawn_chainlist_refresh(
+            client.clone(),
+            runtime.state.clone(),
+            runtime.config.clone(),
+        );
+        spawn_health_loop(
+            client.clone(),
+            runtime.state.clone(),
+            runtime.config.clone(),
+        );
+    }
+    let chain_ids = config
+        .chain_ids()
+        .into_iter()
+        .map(|chain_id| chain_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
 
     let addr = SocketAddr::from(([0, 0, 0, 0], SETTINGS.port));
     let listener = TcpListener::bind(addr).await?;
 
     println!(
-        "Relay RPC listening on http://127.0.0.1:{} (CHAIN_ID={}, MIN_BLOCK_RANGE={})",
-        SETTINGS.port, config.chain_id, config.min_block_range
+        "Relay RPC listening on http://127.0.0.1:{} (CHAIN_IDS={}, MIN_BLOCK_RANGE={})",
+        SETTINGS.port, chain_ids, config.min_block_range
     );
 
-    axum::serve(listener, app(client, state, config)).await?;
+    axum::serve(listener, app(client, Arc::new(chains))).await?;
     Ok(())
 }
 
-fn spawn_health_loop(client: Client, state: Arc<RwLock<RelayState>>, config: Config) {
+async fn initialize_chains(
+    client: &Client,
+    config: &Config,
+) -> Result<HashMap<u64, ChainRuntime>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut chains = HashMap::new();
+
+    for chain_config in &config.chains {
+        let state = Arc::new(RwLock::new(RelayState::new()));
+        refresh_chainlist(client, state.clone(), chain_config).await?;
+        run_health_round(client, state.clone(), chain_config).await;
+
+        chains.insert(
+            chain_config.chain_id,
+            ChainRuntime {
+                config: chain_config.clone(),
+                state,
+            },
+        );
+    }
+
+    Ok(chains)
+}
+
+fn spawn_health_loop(client: Client, state: Arc<RwLock<RelayState>>, config: ChainConfig) {
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(SETTINGS.health_interval_ms));
         loop {
@@ -65,7 +105,7 @@ fn spawn_health_loop(client: Client, state: Arc<RwLock<RelayState>>, config: Con
     });
 }
 
-fn spawn_chainlist_refresh(client: Client, state: Arc<RwLock<RelayState>>, config: Config) {
+fn spawn_chainlist_refresh(client: Client, state: Arc<RwLock<RelayState>>, config: ChainConfig) {
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(SETTINGS.chainlist_refresh_ms));
         loop {

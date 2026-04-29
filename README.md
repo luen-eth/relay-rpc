@@ -4,7 +4,7 @@
   <img src="./assets/readme-banner.png" alt="Relay RPC banner" width="900">
 </p>
 
-Relay RPC is a Rust-based archive RPC proxy for EVM chains. It discovers public RPC endpoints from Chainlist, continuously filters them by archive capability and freshness, and routes JSON-RPC traffic across the healthy upstream pool.
+Relay RPC is a Rust-based multi-chain archive RPC proxy for EVM chains. It discovers public RPC endpoints from Chainlist, continuously filters them by archive capability and freshness, and routes JSON-RPC traffic across each chain's healthy upstream pool.
 
 It is designed for workloads that need both historical access and near-head realtime freshness.
 
@@ -13,7 +13,7 @@ It is designed for workloads that need both historical access and near-head real
 - Rust HTTP service built with Tokio, Axum, and Reqwest.
 - Chainlist-powered public RPC discovery.
 - Optional `customrpclist.json` support for appending your own RPC endpoints.
-- `.env` has only two required values: `CHAIN_ID` and `MIN_BLOCK_RANGE`.
+- `.env` has only two required values: `CHAIN_IDS` and `MIN_BLOCK_RANGE`.
 - Rejects stale RPCs that are too far behind the freshest observed head.
 - Requires `eth_getLogs` support above `10,000` blocks.
 - Checks recent log ranges and historical archive access.
@@ -28,12 +28,12 @@ It is designed for workloads that need both historical access and near-head real
 
 ```mermaid
 flowchart LR
-  Chainlist["Chainlist RPC Registry"] --> Discovery["Discovery Loop<br/>every 5 minutes"]
-  Discovery --> Pool["Endpoint Pool"]
+  Chainlist["Chainlist RPC Registry"] --> Discovery["Per-chain discovery loop<br/>every 5 minutes"]
+  Discovery --> Pool["Endpoint Pools<br/>one pool per chain ID"]
   Pool --> Health["Health Loop<br/>every 5 seconds"]
   Health --> Checks["chainId<br/>latest block<br/>recent logs range<br/>historical state<br/>historical logs range"]
   Checks --> Healthy["Healthy Archive RPC Set"]
-  Client["JSON-RPC Client"] --> Relay["Relay RPC<br/>:8546"]
+  Client["JSON-RPC Client"] --> Relay["Relay RPC<br/>:8546/{chainId}/"]
   Relay --> Router["Range-Aware Router"]
   Healthy --> Router
   Router --> RPC1["Healthy RPC A"]
@@ -66,7 +66,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Start["RPC endpoint"] --> Chain["eth_chainId matches CHAIN_ID"]
+  Start["RPC endpoint"] --> Chain["eth_chainId matches requested chain"]
   Chain --> Block["eth_blockNumber succeeds"]
   Block --> Fresh["Latest block is within max lag"]
   Fresh --> Recent["Recent eth_getLogs range >= MIN_BLOCK_RANGE"]
@@ -107,7 +107,7 @@ flowchart TD
 Create `.env`:
 
 ```env
-CHAIN_ID=56
+CHAIN_IDS=56
 MIN_BLOCK_RANGE=10001
 ```
 
@@ -115,12 +115,19 @@ Only these two values are read from `.env`.
 
 | Variable | Description |
 |---|---|
-| `CHAIN_ID` | EVM chain ID used to select the Chainlist RPC list. |
+| `CHAIN_IDS` | Comma-separated EVM chain IDs used to select Chainlist RPC lists. |
 | `MIN_BLOCK_RANGE` | Minimum accepted `eth_getLogs` range. Must be greater than `10000`. |
+
+Multi-chain example:
+
+```env
+CHAIN_IDS=56,1,137,42161,8453,43114
+MIN_BLOCK_RANGE=10001
+```
 
 ### Custom RPC List
 
-Relay RPC always reads Chainlist first. If a `customrpclist.json` file exists in the working directory, its `rpc` array is appended to the Chainlist endpoints before health checks begin.
+Relay RPC always reads Chainlist first. If a `customrpclist.json` file exists in the working directory, matching custom RPC arrays are appended to the Chainlist endpoints before health checks begin.
 
 Copy the example file:
 
@@ -132,11 +139,21 @@ Example format:
 
 ```json
 {
-  "chainId": 56,
-  "rpc": [
-    "https://your-first-archive-rpc.example",
+  "chains": [
     {
-      "url": "https://your-second-archive-rpc.example"
+      "chainId": 56,
+      "rpc": [
+        "https://your-bsc-archive-rpc.example",
+        {
+          "url": "https://your-second-bsc-archive-rpc.example"
+        }
+      ]
+    },
+    {
+      "chainId": 1,
+      "rpc": [
+        "https://your-ethereum-archive-rpc.example"
+      ]
     }
   ]
 }
@@ -144,9 +161,11 @@ Example format:
 
 Notes:
 
-- `chainId` is optional. When present, it must match `CHAIN_ID`; otherwise the file is ignored.
+- `chains` is the recommended format for multi-chain deployments.
+- A single `{ "chainId": 56, "rpc": [...] }` object is still supported.
+- A raw `rpc` array is supported for simple single-chain deployments.
 - `rpc` accepts strings or Chainlist-style objects with a `url` field.
-- Duplicate URLs are removed after Chainlist and custom endpoints are merged.
+- Duplicate URLs are removed per chain after Chainlist and custom endpoints are merged.
 - `customrpclist.json` is ignored by git because it may contain private RPC keys.
 
 Internal defaults:
@@ -169,21 +188,33 @@ cargo run --release
 Proxy URL:
 
 ```text
-http://127.0.0.1:8546
+http://127.0.0.1:8546/56/
 ```
 
-Example request:
+BSC example request:
 
 ```bash
-curl -s http://127.0.0.1:8546 \
+curl -s http://127.0.0.1:8546/56/ \
   -H "content-type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+```
+
+Every configured chain is routed by path:
+
+```text
+http://yourdomain.com/56/     # BNB Smart Chain
+http://yourdomain.com/1/      # Ethereum
+http://yourdomain.com/137/    # Polygon
+http://yourdomain.com/42161/  # Arbitrum One
+http://yourdomain.com/8453/   # Base
+http://yourdomain.com/43114/  # Avalanche C-Chain
 ```
 
 Relay RPC adds these response headers:
 
 ```text
 x-upstream-rpc: <selected upstream URL>
+x-proxy-chain-id: <selected chain ID>
 x-proxy-healthy-count: <current healthy upstream count>
 ```
 
@@ -231,27 +262,32 @@ Full endpoint state:
 curl -s http://127.0.0.1:8546/rpcs
 ```
 
+Chain-specific health and endpoint state:
+
+```bash
+curl -s http://127.0.0.1:8546/56/health
+curl -s http://127.0.0.1:8546/56/rpcs
+```
+
 Example health response:
 
 ```json
 {
   "ok": true,
-  "healthyCount": 2,
-  "totalCount": 51,
-  "referenceLatestBlock": 95317841,
+  "chainCount": 2,
+  "healthyChainCount": 2,
   "config": {
-    "chainId": 56,
+    "chainIds": [1, 56],
     "minBlockRange": 10001
   },
-  "healthyRpcs": [
+  "chains": [
     {
-      "url": "https://rpc.example",
-      "lag": 2,
-      "range": {
-        "minSupported": 10001,
-        "maxObserved": 10001,
-        "rejectedAbove": null
-      }
+      "chainId": 56,
+      "ok": true,
+      "healthyCount": 2,
+      "totalCount": 51,
+      "referenceLatestBlock": 95317841,
+      "healthyRpcs": []
     }
   ]
 }
@@ -259,4 +295,4 @@ Example health response:
 
 ## Notes
 
-For BNB Smart Chain (`CHAIN_ID=56`), Relay RPC includes a strict historical archive probe against a known verified contract and block. For other chains, it still checks chain ID, freshness, recent log range, historical balance access, and historical log range. You can add strict chain-specific probes in `src/settings.rs`.
+For BNB Smart Chain (`CHAIN_IDS` containing `56`), Relay RPC includes a strict historical archive probe against a known verified contract and block. For other chains, it still checks chain ID, freshness, recent log range, historical balance access, and historical log range. You can add strict chain-specific probes in `src/settings.rs`.
