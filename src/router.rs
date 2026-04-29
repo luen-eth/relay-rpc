@@ -5,6 +5,7 @@ use reqwest::{Client, StatusCode};
 use tokio::sync::RwLock;
 
 use crate::{
+    config::ChainConfig,
     request_analysis::analyze_body,
     rpc::{
         is_range_error, is_rate_limit_error, only_retryable_errors, raw_proxy_call,
@@ -19,37 +20,59 @@ use crate::{
 pub async fn proxy_request(
     client: &Client,
     state: Arc<RwLock<RelayState>>,
+    config: &ChainConfig,
     body: Bytes,
 ) -> Result<ProxiedResponse, ProxyError> {
     let analysis = analyze_body(&body);
-    let ordered = {
+    let (ordered, selected_pool) = {
         let mut state = state.write().await;
-        let mut candidates = state
-            .healthy_endpoints()
+        let prefer_archive =
+            analysis.prefers_archive_pool(state.reference_latest_block, config.min_block_range);
+        let mut selected_pool = if prefer_archive {
+            RoutePool::Archive
+        } else {
+            RoutePool::Rpc
+        };
+
+        let mut candidates = endpoints_for_pool(&state, selected_pool, config.max_health_age_ms)
             .into_iter()
             .filter(|endpoint| endpoint_supports_range(endpoint, analysis.max_get_logs_range))
             .collect::<Vec<_>>();
 
         if candidates.is_empty() {
-            candidates = state.healthy_endpoints();
+            candidates = endpoints_for_pool(&state, selected_pool, config.max_health_age_ms);
+        }
+
+        if candidates.is_empty() && selected_pool == RoutePool::Rpc {
+            candidates = endpoints_for_pool(&state, RoutePool::Archive, config.max_health_age_ms)
+                .into_iter()
+                .filter(|endpoint| endpoint_supports_range(endpoint, analysis.max_get_logs_range))
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                selected_pool = RoutePool::Archive;
+            }
         }
 
         if candidates.is_empty() {
             return Err(ProxyError::NoHealthyUpstream);
         }
 
+        let route_key = format!("{}:{}", selected_pool.as_str(), analysis.route_key);
         let index = state
             .round_robin
-            .entry(analysis.route_key.clone())
+            .entry(route_key)
             .and_modify(|value| *value += 1)
             .or_insert(1);
         let start = (*index - 1) % candidates.len();
         candidates.rotate_left(start);
-        candidates
-            .into_iter()
-            .take(SETTINGS.retry_attempts)
-            .map(|endpoint| endpoint.url)
-            .collect::<Vec<_>>()
+        (
+            candidates
+                .into_iter()
+                .take(SETTINGS.retry_attempts)
+                .map(|endpoint| endpoint.url)
+                .collect::<Vec<_>>(),
+            selected_pool,
+        )
     };
 
     let mut last_failure = None;
@@ -63,6 +86,7 @@ pub async fn proxy_request(
             }
             return Ok(ProxiedResponse {
                 upstream: url,
+                pool: selected_pool,
                 response: upstream,
             });
         }
@@ -83,6 +107,17 @@ pub async fn proxy_request(
             .and_then(|failure| failure.error)
             .unwrap_or_else(|| "all upstreams failed".to_string()),
     ))
+}
+
+fn endpoints_for_pool(
+    state: &RelayState,
+    pool: RoutePool,
+    max_health_age_ms: u64,
+) -> Vec<crate::types::Endpoint> {
+    match pool {
+        RoutePool::Rpc => state.rpc_endpoints(max_health_age_ms),
+        RoutePool::Archive => state.healthy_endpoints(max_health_age_ms),
+    }
 }
 
 async fn apply_proxy_failure(
@@ -115,6 +150,7 @@ async fn apply_proxy_failure(
         return;
     }
 
+    endpoint.cooldown_until_ms = now_ms() + SETTINGS.rate_limit_cooldown_ms;
     endpoint.healthy = false;
     endpoint.reason = vec![upstream
         .error
@@ -124,7 +160,23 @@ async fn apply_proxy_failure(
 
 pub struct ProxiedResponse {
     pub upstream: String,
+    pub pool: RoutePool,
     pub response: RawProxyResponse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutePool {
+    Rpc,
+    Archive,
+}
+
+impl RoutePool {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rpc => "rpc",
+            Self::Archive => "archive",
+        }
+    }
 }
 
 #[derive(Debug)]

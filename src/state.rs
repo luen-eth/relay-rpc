@@ -30,12 +30,42 @@ impl RelayState {
         }
     }
 
-    pub fn healthy_endpoints(&self) -> Vec<Endpoint> {
+    pub fn healthy_endpoints(&self, max_health_age_ms: u64) -> Vec<Endpoint> {
+        self.archive_endpoints(max_health_age_ms)
+    }
+
+    pub fn archive_endpoints(&self, max_health_age_ms: u64) -> Vec<Endpoint> {
         let now = now_ms();
         let mut endpoints: Vec<_> = self
             .endpoints
             .values()
-            .filter(|endpoint| endpoint_usable(endpoint, self.reference_latest_block, now))
+            .filter(|endpoint| {
+                endpoint_archive_usable(
+                    endpoint,
+                    self.reference_latest_block,
+                    now,
+                    max_health_age_ms,
+                )
+            })
+            .cloned()
+            .collect();
+        endpoints.sort_by_key(|endpoint| endpoint_score(endpoint, self.reference_latest_block));
+        endpoints
+    }
+
+    pub fn rpc_endpoints(&self, max_health_age_ms: u64) -> Vec<Endpoint> {
+        let now = now_ms();
+        let mut endpoints: Vec<_> = self
+            .endpoints
+            .values()
+            .filter(|endpoint| {
+                endpoint_rpc_usable(
+                    endpoint,
+                    self.reference_latest_block,
+                    now,
+                    max_health_age_ms,
+                )
+            })
             .cloned()
             .collect();
         endpoints.sort_by_key(|endpoint| endpoint_score(endpoint, self.reference_latest_block));
@@ -43,8 +73,23 @@ impl RelayState {
     }
 }
 
-pub fn endpoint_usable(endpoint: &Endpoint, reference_latest_block: u64, now: u64) -> bool {
-    if !endpoint.healthy || endpoint.cooldown_until_ms > now {
+pub fn endpoint_archive_usable(
+    endpoint: &Endpoint,
+    reference_latest_block: u64,
+    now: u64,
+    max_health_age_ms: u64,
+) -> bool {
+    endpoint.healthy
+        && endpoint_rpc_usable(endpoint, reference_latest_block, now, max_health_age_ms)
+}
+
+pub fn endpoint_rpc_usable(
+    endpoint: &Endpoint,
+    reference_latest_block: u64,
+    now: u64,
+    max_health_age_ms: u64,
+) -> bool {
+    if endpoint.cooldown_until_ms > now {
         return false;
     }
     let Some(latest_block) = endpoint.latest_block else {
@@ -54,7 +99,9 @@ pub fn endpoint_usable(endpoint: &Endpoint, reference_latest_block: u64, now: u6
         return false;
     };
     latest_block + SETTINGS.max_block_lag >= reference_latest_block
-        && now.saturating_sub(last_checked_at_ms) <= SETTINGS.max_health_age_ms
+        && now.saturating_sub(last_checked_at_ms) <= max_health_age_ms
+        && endpoint.checks.chain_ok
+        && endpoint.checks.recent_range_ok
 }
 
 pub fn endpoint_score(endpoint: &Endpoint, reference_latest_block: u64) -> u64 {
@@ -96,6 +143,10 @@ pub fn note_range_rejected(endpoint: &mut Endpoint, requested_range: Option<u64>
 pub struct PublicEndpoint {
     pub url: String,
     pub healthy: bool,
+    #[serde(rename = "rpcUsable")]
+    pub rpc_usable: bool,
+    #[serde(rename = "archiveUsable")]
+    pub archive_usable: bool,
     pub usable: bool,
     pub reason: Vec<String>,
     #[serde(rename = "latestBlock")]
@@ -120,11 +171,18 @@ pub struct PublicEndpoint {
 }
 
 impl PublicEndpoint {
-    pub fn from_endpoint(endpoint: &Endpoint, reference_latest_block: u64, usable: bool) -> Self {
+    pub fn from_endpoint(
+        endpoint: &Endpoint,
+        reference_latest_block: u64,
+        rpc_usable: bool,
+        archive_usable: bool,
+    ) -> Self {
         Self {
             url: endpoint.url.clone(),
             healthy: endpoint.healthy,
-            usable,
+            rpc_usable,
+            archive_usable,
+            usable: archive_usable,
             reason: endpoint.reason.clone(),
             latest_block: endpoint.latest_block,
             reference_latest_block,

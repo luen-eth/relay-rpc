@@ -13,7 +13,7 @@ It is designed for workloads that need both historical access and near-head real
 - Rust HTTP service built with Tokio, Axum, and Reqwest.
 - Chainlist-powered public RPC discovery.
 - Optional `customrpclist.json` support for appending your own RPC endpoints.
-- `.env` has only two required values: `CHAIN_IDS` and `MIN_BLOCK_RANGE`.
+- `.env` controls chain IDs, minimum block range, and health check interval.
 - Rejects stale RPCs that are too far behind the freshest observed head.
 - Requires `eth_getLogs` support above `10,000` blocks.
 - Checks recent log ranges and historical archive access.
@@ -32,10 +32,12 @@ flowchart LR
   Discovery --> Pool["Endpoint Pools<br/>one pool per chain ID"]
   Pool --> Health["Health Loop<br/>every 5 seconds"]
   Health --> Checks["chainId<br/>latest block<br/>recent logs range<br/>historical state<br/>historical logs range"]
-  Checks --> Healthy["Healthy Archive RPC Set"]
+  Checks --> RpcPool["Healthy RPC Pool<br/>recent requests"]
+  Checks --> ArchivePool["Healthy Archive Pool<br/>historical requests"]
   Client["JSON-RPC Client"] --> Relay["Relay RPC<br/>:8546/{chainId}/"]
   Relay --> Router["Range-Aware Router"]
-  Healthy --> Router
+  RpcPool --> Router
+  ArchivePool --> Router
   Router --> RPC1["Healthy RPC A"]
   Router --> RPC2["Healthy RPC B"]
   Router --> RPC3["Healthy RPC C"]
@@ -45,9 +47,12 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  Request["Incoming JSON-RPC request"] --> Analyze["Analyze method and eth_getLogs range"]
-  Analyze --> Healthy["Select fresh healthy RPCs"]
-  Healthy --> Range{"Known requested range?"}
+  Request["Incoming JSON-RPC request"] --> Analyze["Analyze method, block tags, and eth_getLogs range"]
+  Analyze --> Near{"Recent block window?"}
+  Near -- "Yes" --> RpcPool["RPC Pool<br/>fresh non-archive endpoints"]
+  Near -- "No" --> ArchivePool["Archive Pool<br/>historical endpoints"]
+  RpcPool --> Range{"Known requested range?"}
+  ArchivePool --> Range
   Range -- "No" --> RoundRobin["Round-robin by route key"]
   Range -- "Yes" --> Filter["Prefer RPCs known to support that range"]
   Filter --> RoundRobin
@@ -109,20 +114,21 @@ Create `.env`:
 ```env
 CHAIN_IDS=56
 MIN_BLOCK_RANGE=10001
+HEALTH_INTERVAL_MS=5000
 ```
-
-Only these two values are read from `.env`.
 
 | Variable | Description |
 |---|---|
 | `CHAIN_IDS` | Comma-separated EVM chain IDs used to select Chainlist RPC lists. |
 | `MIN_BLOCK_RANGE` | Minimum accepted `eth_getLogs` range. Must be greater than `10000`. |
+| `HEALTH_INTERVAL_MS` | Health check interval in milliseconds. Defaults to `5000`. |
 
 Multi-chain example:
 
 ```env
 CHAIN_IDS=56,1,137,42161,8453,43114
 MIN_BLOCK_RANGE=10001
+HEALTH_INTERVAL_MS=5000
 ```
 
 ### Custom RPC List
@@ -174,9 +180,9 @@ Internal defaults:
 |---|---:|
 | Port | `8546` |
 | Chainlist refresh | `5 minutes` |
-| Health interval | `5 seconds` |
+| Default health interval | `5 seconds` |
 | Max block lag | `15 blocks` |
-| Max health age | `15 seconds` |
+| Max health age | `max(15 seconds, HEALTH_INTERVAL_MS * 3)` |
 | Rate-limit cooldown | `30 seconds` |
 
 ## Run Locally
@@ -215,8 +221,13 @@ Relay RPC adds these response headers:
 ```text
 x-upstream-rpc: <selected upstream URL>
 x-proxy-chain-id: <selected chain ID>
-x-proxy-healthy-count: <current healthy upstream count>
+x-proxy-pool: <rpc or archive>
+x-proxy-healthy-count: <healthy count for selected pool>
+x-proxy-rpc-healthy-count: <fresh RPC pool count>
+x-proxy-archive-healthy-count: <archive pool count>
 ```
+
+Recent requests are routed to the RPC pool when their explicit block tags are inside the recent window derived from `MIN_BLOCK_RANGE`. Historical `eth_getLogs` ranges, `blockHash` log queries, and old block-tag calls are routed to the archive pool.
 
 ## Run With Docker
 
@@ -269,6 +280,8 @@ curl -s http://127.0.0.1:8546/56/health
 curl -s http://127.0.0.1:8546/56/rpcs
 ```
 
+`healthyCount` is the archive-capable count for compatibility. `rpcHealthyCount` shows the fresh RPC pool size, and `archiveHealthyCount` shows the historical pool size.
+
 Example health response:
 
 ```json
@@ -278,13 +291,16 @@ Example health response:
   "healthyChainCount": 2,
   "config": {
     "chainIds": [1, 56],
-    "minBlockRange": 10001
+    "minBlockRange": 10001,
+    "healthIntervalMs": 5000
   },
   "chains": [
     {
       "chainId": 56,
       "ok": true,
       "healthyCount": 2,
+      "rpcHealthyCount": 14,
+      "archiveHealthyCount": 2,
       "totalCount": 51,
       "referenceLatestBlock": 95317841,
       "healthyRpcs": []

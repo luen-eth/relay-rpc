@@ -17,7 +17,7 @@ use crate::{
     config::ChainConfig,
     router::proxy_request,
     settings::SETTINGS,
-    state::{endpoint_usable, PublicEndpoint, RelayState},
+    state::{endpoint_archive_usable, endpoint_rpc_usable, PublicEndpoint, RelayState},
     util::now_ms,
 };
 
@@ -87,7 +87,7 @@ async fn proxy_for_runtime(client: Client, runtime: ChainRuntime, body: Bytes) -
             .into_response();
     }
 
-    match proxy_request(&client, runtime.state.clone(), body).await {
+    match proxy_request(&client, runtime.state.clone(), &runtime.config, body).await {
         Ok(proxied) => {
             let mut response = (proxied.response.status, proxied.response.body).into_response();
             let headers = response.headers_mut();
@@ -106,16 +106,37 @@ async fn proxy_for_runtime(client: Client, runtime: ChainRuntime, body: Bytes) -
                 HeaderValue::from_str(&runtime.config.chain_id.to_string())
                     .unwrap_or_else(|_| HeaderValue::from_static("0")),
             );
-            let healthy_count = runtime
-                .state
-                .read()
-                .await
-                .healthy_endpoints()
-                .len()
-                .to_string();
+            headers.insert(
+                HeaderName::from_static("x-proxy-pool"),
+                HeaderValue::from_static(proxied.pool.as_str()),
+            );
+            let (rpc_count, archive_count) = {
+                let state = runtime.state.read().await;
+                (
+                    state.rpc_endpoints(runtime.config.max_health_age_ms).len(),
+                    state
+                        .healthy_endpoints(runtime.config.max_health_age_ms)
+                        .len(),
+                )
+            };
+            let healthy_count = match proxied.pool {
+                crate::router::RoutePool::Rpc => rpc_count,
+                crate::router::RoutePool::Archive => archive_count,
+            }
+            .to_string();
             headers.insert(
                 HeaderName::from_static("x-proxy-healthy-count"),
                 HeaderValue::from_str(&healthy_count)
+                    .unwrap_or_else(|_| HeaderValue::from_static("0")),
+            );
+            headers.insert(
+                HeaderName::from_static("x-proxy-rpc-healthy-count"),
+                HeaderValue::from_str(&rpc_count.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("0")),
+            );
+            headers.insert(
+                HeaderName::from_static("x-proxy-archive-healthy-count"),
+                HeaderValue::from_str(&archive_count.to_string())
                     .unwrap_or_else(|_| HeaderValue::from_static("0")),
             );
             response
@@ -142,7 +163,7 @@ async fn rpcs(State(app): State<AppState>) -> Json<MultiRpcsResponse> {
         chains.push(RpcsResponse {
             chain_id: runtime.config.chain_id,
             health: health_response(&state, &runtime.config),
-            endpoints: public_endpoints(&state),
+            endpoints: public_endpoints(&state, &runtime.config),
         });
     }
 
@@ -167,7 +188,7 @@ async fn chain_rpcs(Path(chain_id): Path<u64>, State(app): State<AppState>) -> R
     Json(RpcsResponse {
         chain_id,
         health: health_response(&state, &runtime.config),
-        endpoints: public_endpoints(&state),
+        endpoints: public_endpoints(&state, &runtime.config),
     })
     .into_response()
 }
@@ -186,17 +207,14 @@ async fn multi_health_response(app: &AppState) -> MultiHealthResponse {
         healthy_chain_count,
         config: PublicMultiConfig {
             chain_ids: sorted_chain_ids(app),
-            min_block_range: app
-                .chains
-                .values()
-                .next()
-                .map(|runtime| runtime.config.min_block_range)
-                .unwrap_or_default(),
+            min_block_range: first_runtime(app).map_or(0, |runtime| runtime.config.min_block_range),
             port: SETTINGS.port,
-            health_interval_ms: SETTINGS.health_interval_ms,
+            health_interval_ms: first_runtime(app)
+                .map_or(0, |runtime| runtime.config.health_interval_ms),
             chainlist_refresh_ms: SETTINGS.chainlist_refresh_ms,
             max_block_lag: SETTINGS.max_block_lag,
-            max_health_age_ms: SETTINGS.max_health_age_ms,
+            max_health_age_ms: first_runtime(app)
+                .map_or(0, |runtime| runtime.config.max_health_age_ms),
             rate_limit_cooldown_ms: SETTINGS.rate_limit_cooldown_ms,
         },
         chains,
@@ -204,11 +222,14 @@ async fn multi_health_response(app: &AppState) -> MultiHealthResponse {
 }
 
 fn health_response(state: &RelayState, config: &ChainConfig) -> HealthResponse {
-    let healthy = state.healthy_endpoints();
+    let archive = state.healthy_endpoints(config.max_health_age_ms);
+    let rpc = state.rpc_endpoints(config.max_health_age_ms);
     HealthResponse {
         chain_id: config.chain_id,
-        ok: !healthy.is_empty(),
-        healthy_count: healthy.len(),
+        ok: !archive.is_empty() || !rpc.is_empty(),
+        healthy_count: archive.len(),
+        rpc_healthy_count: rpc.len(),
+        archive_healthy_count: archive.len(),
         total_count: state.endpoints.len(),
         reference_latest_block: state.reference_latest_block,
         round: state.round,
@@ -220,33 +241,50 @@ fn health_response(state: &RelayState, config: &ChainConfig) -> HealthResponse {
             chain_id: config.chain_id,
             min_block_range: config.min_block_range,
             port: SETTINGS.port,
-            health_interval_ms: SETTINGS.health_interval_ms,
+            health_interval_ms: config.health_interval_ms,
             chainlist_refresh_ms: SETTINGS.chainlist_refresh_ms,
             max_block_lag: SETTINGS.max_block_lag,
-            max_health_age_ms: SETTINGS.max_health_age_ms,
+            max_health_age_ms: config.max_health_age_ms,
             rate_limit_cooldown_ms: SETTINGS.rate_limit_cooldown_ms,
         },
-        healthy_rpcs: public_endpoints_from_slice(state, &healthy),
+        healthy_rpcs: public_endpoints_from_slice(state, &archive, config),
     }
 }
 
-fn public_endpoints(state: &RelayState) -> Vec<PublicEndpoint> {
-    let healthy = state.healthy_endpoints();
-    public_endpoints_for(state, &healthy)
+fn public_endpoints(state: &RelayState, config: &ChainConfig) -> Vec<PublicEndpoint> {
+    let archive = state.healthy_endpoints(config.max_health_age_ms);
+    public_endpoints_for(state, &archive, config)
 }
 
 fn public_endpoints_for(
     state: &RelayState,
-    healthy: &[crate::types::Endpoint],
+    archive: &[crate::types::Endpoint],
+    config: &ChainConfig,
 ) -> Vec<PublicEndpoint> {
     let now = now_ms();
     state
         .endpoints
         .values()
         .map(|endpoint| {
-            let usable = healthy.iter().any(|healthy| healthy.url == endpoint.url)
-                && endpoint_usable(endpoint, state.reference_latest_block, now);
-            PublicEndpoint::from_endpoint(endpoint, state.reference_latest_block, usable)
+            let archive_usable = archive.iter().any(|archive| archive.url == endpoint.url)
+                && endpoint_archive_usable(
+                    endpoint,
+                    state.reference_latest_block,
+                    now,
+                    config.max_health_age_ms,
+                );
+            let rpc_usable = endpoint_rpc_usable(
+                endpoint,
+                state.reference_latest_block,
+                now,
+                config.max_health_age_ms,
+            );
+            PublicEndpoint::from_endpoint(
+                endpoint,
+                state.reference_latest_block,
+                rpc_usable,
+                archive_usable,
+            )
         })
         .collect()
 }
@@ -254,13 +292,30 @@ fn public_endpoints_for(
 fn public_endpoints_from_slice(
     state: &RelayState,
     endpoints: &[crate::types::Endpoint],
+    config: &ChainConfig,
 ) -> Vec<PublicEndpoint> {
     let now = now_ms();
     endpoints
         .iter()
         .map(|endpoint| {
-            let usable = endpoint_usable(endpoint, state.reference_latest_block, now);
-            PublicEndpoint::from_endpoint(endpoint, state.reference_latest_block, usable)
+            let archive_usable = endpoint_archive_usable(
+                endpoint,
+                state.reference_latest_block,
+                now,
+                config.max_health_age_ms,
+            );
+            let rpc_usable = endpoint_rpc_usable(
+                endpoint,
+                state.reference_latest_block,
+                now,
+                config.max_health_age_ms,
+            );
+            PublicEndpoint::from_endpoint(
+                endpoint,
+                state.reference_latest_block,
+                rpc_usable,
+                archive_usable,
+            )
         })
         .collect()
 }
@@ -275,6 +330,10 @@ fn sorted_chain_ids(app: &AppState) -> Vec<u64> {
     let mut chain_ids = app.chains.keys().copied().collect::<Vec<_>>();
     chain_ids.sort_unstable();
     chain_ids
+}
+
+fn first_runtime(app: &AppState) -> Option<ChainRuntime> {
+    sorted_runtimes(app).into_iter().next()
 }
 
 fn chain_not_found(chain_id: u64) -> Response {
@@ -344,6 +403,10 @@ pub struct HealthResponse {
     pub ok: bool,
     #[serde(rename = "healthyCount")]
     pub healthy_count: usize,
+    #[serde(rename = "rpcHealthyCount")]
+    pub rpc_healthy_count: usize,
+    #[serde(rename = "archiveHealthyCount")]
+    pub archive_healthy_count: usize,
     #[serde(rename = "totalCount")]
     pub total_count: usize,
     #[serde(rename = "referenceLatestBlock")]

@@ -64,8 +64,12 @@ async fn main() -> anyhow_free::Result<()> {
     let listener = TcpListener::bind(addr).await?;
 
     println!(
-        "Relay RPC listening on http://127.0.0.1:{} (CHAIN_IDS={}, MIN_BLOCK_RANGE={})",
-        SETTINGS.port, chain_ids, config.min_block_range
+        "Relay RPC listening on http://127.0.0.1:{} (CHAIN_IDS={}, MIN_BLOCK_RANGE={}, HEALTH_INTERVAL_MS={}, MAX_HEALTH_AGE_MS={})",
+        SETTINGS.port,
+        chain_ids,
+        config.min_block_range,
+        config.health_interval_ms,
+        config.max_health_age_ms
     );
 
     axum::serve(listener, app(client, Arc::new(chains))).await?;
@@ -97,7 +101,7 @@ async fn initialize_chains(
 
 fn spawn_health_loop(client: Client, state: Arc<RwLock<RelayState>>, config: ChainConfig) {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(SETTINGS.health_interval_ms));
+        let mut interval = time::interval(Duration::from_millis(config.health_interval_ms));
         loop {
             interval.tick().await;
             run_health_round(&client, state.clone(), &config).await;

@@ -60,11 +60,12 @@ pub async fn run_health_round(
                 snapshot,
                 reference_latest_block,
                 config.min_block_range,
+                config.max_health_age_ms,
             );
         }
     }
 
-    let healthy_count = state.healthy_endpoints().len();
+    let healthy_count = state.healthy_endpoints(config.max_health_age_ms).len();
     let total_count = state.endpoints.len();
     let round = state.round;
 
@@ -246,6 +247,7 @@ fn apply_snapshot(
     snapshot: HealthSnapshot,
     reference_latest_block: u64,
     min_block_range: u64,
+    max_health_age_ms: u64,
 ) {
     endpoint.latest_block = snapshot.latest_block;
     endpoint.latency_ms = Some(snapshot.latency_ms);
@@ -256,8 +258,7 @@ fn apply_snapshot(
     endpoint.checks.lag_ok = endpoint
         .latest_block
         .is_some_and(|latest| latest + SETTINGS.max_block_lag >= reference_latest_block);
-    endpoint.checks.fresh_ok =
-        now_ms().saturating_sub(snapshot.checked_at_ms) <= SETTINGS.max_health_age_ms;
+    endpoint.checks.fresh_ok = now_ms().saturating_sub(snapshot.checked_at_ms) <= max_health_age_ms;
 
     endpoint.healthy = endpoint.checks.chain_ok
         && endpoint.checks.archive_ok

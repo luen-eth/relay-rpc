@@ -1,9 +1,13 @@
 use std::{collections::HashMap, env, fs, path::Path};
 
+use crate::settings::SETTINGS;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub chains: Vec<ChainConfig>,
     pub min_block_range: u64,
+    pub health_interval_ms: u64,
+    pub max_health_age_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -11,6 +15,8 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub chain_id_hex: String,
     pub min_block_range: u64,
+    pub health_interval_ms: u64,
+    pub max_health_age_ms: u64,
 }
 
 impl Config {
@@ -18,9 +24,17 @@ impl Config {
         let dot_env = read_dot_env(".env");
         let chain_ids = read_chain_ids(&dot_env)?;
         let min_block_range = read_u64("MIN_BLOCK_RANGE", 10001, &dot_env)?;
+        let health_interval_ms =
+            read_u64("HEALTH_INTERVAL_MS", SETTINGS.health_interval_ms, &dot_env)?;
+        let max_health_age_ms = SETTINGS
+            .max_health_age_ms
+            .max(health_interval_ms.saturating_mul(3));
 
         if min_block_range <= 10_000 {
             return Err("MIN_BLOCK_RANGE must be greater than 10000".into());
+        }
+        if health_interval_ms == 0 {
+            return Err("HEALTH_INTERVAL_MS must be greater than 0".into());
         }
 
         let chains = chain_ids
@@ -29,12 +43,16 @@ impl Config {
                 chain_id,
                 chain_id_hex: format!("0x{:x}", chain_id),
                 min_block_range,
+                health_interval_ms,
+                max_health_age_ms,
             })
             .collect();
 
         Ok(Self {
             chains,
             min_block_range,
+            health_interval_ms,
+            max_health_age_ms,
         })
     }
 
