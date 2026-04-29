@@ -1,0 +1,17 @@
+[package]
+name = "relay-rpc"
+version = "0.1.0"
+edition = "2021"
+description = "A Chainlist-powered archive RPC proxy and range-aware load balancer."
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+bytes = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

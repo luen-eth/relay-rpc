@@ -1,0 +1,9 @@
+{
+  "chainId": 56,
+  "rpc": [
+    "https://your-first-archive-rpc.example",
+    {
+      "url": "https://your-second-archive-rpc.example"
+    }
+  ]
+}

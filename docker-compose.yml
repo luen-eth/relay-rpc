@@ -1,0 +1,13 @@
+services:
+  relay-rpc:
+    build:
+      context: .
+    container_name: relay-rpc
+    env_file:
+      - .env
+    ports:
+      - "8546:8546"
+    # After creating customrpclist.json, mount it like this:
+    # volumes:
+    #   - ./customrpclist.json:/app/customrpclist.json:ro
+    restart: unless-stopped
