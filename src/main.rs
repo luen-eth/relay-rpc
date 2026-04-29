@@ -35,6 +35,23 @@ async fn main() -> anyhow_free::Result<()> {
         .init();
 
     let config = Config::load()?;
+    let chain_ids = config
+        .chain_ids()
+        .into_iter()
+        .map(|chain_id| chain_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "Relay RPC config loaded (CHAIN_IDS={} from {}, MIN_BLOCK_RANGE={} from {}, HEALTH_INTERVAL_MS={} from {}, MAX_HEALTH_AGE_MS={})",
+        chain_ids,
+        config.sources.chain_ids,
+        config.min_block_range,
+        config.sources.min_block_range,
+        config.health_interval_ms,
+        config.sources.health_interval_ms,
+        config.max_health_age_ms
+    );
+
     let client = Client::builder()
         .user_agent(SETTINGS.user_agent)
         .timeout(Duration::from_millis(SETTINGS.proxy_timeout_ms))
@@ -53,23 +70,12 @@ async fn main() -> anyhow_free::Result<()> {
             runtime.config.clone(),
         );
     }
-    let chain_ids = config
-        .chain_ids()
-        .into_iter()
-        .map(|chain_id| chain_id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
     let addr = SocketAddr::from(([0, 0, 0, 0], SETTINGS.port));
     let listener = TcpListener::bind(addr).await?;
 
     println!(
-        "Relay RPC listening on http://127.0.0.1:{} (CHAIN_IDS={}, MIN_BLOCK_RANGE={}, HEALTH_INTERVAL_MS={}, MAX_HEALTH_AGE_MS={})",
-        SETTINGS.port,
-        chain_ids,
-        config.min_block_range,
-        config.health_interval_ms,
-        config.max_health_age_ms
+        "Relay RPC listening on http://127.0.0.1:{} (CHAIN_IDS={})",
+        SETTINGS.port, chain_ids
     );
 
     axum::serve(listener, app(client, Arc::new(chains))).await?;
@@ -101,9 +107,8 @@ async fn initialize_chains(
 
 fn spawn_health_loop(client: Client, state: Arc<RwLock<RelayState>>, config: ChainConfig) {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(config.health_interval_ms));
         loop {
-            interval.tick().await;
+            time::sleep(Duration::from_millis(config.health_interval_ms)).await;
             run_health_round(&client, state.clone(), &config).await;
         }
     });
@@ -111,9 +116,8 @@ fn spawn_health_loop(client: Client, state: Arc<RwLock<RelayState>>, config: Cha
 
 fn spawn_chainlist_refresh(client: Client, state: Arc<RwLock<RelayState>>, config: ChainConfig) {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(SETTINGS.chainlist_refresh_ms));
         loop {
-            interval.tick().await;
+            time::sleep(Duration::from_millis(SETTINGS.chainlist_refresh_ms)).await;
             if let Err(error) = refresh_chainlist(&client, state.clone(), &config).await {
                 error!(%error, "chainlist refresh failed");
             }

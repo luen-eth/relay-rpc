@@ -15,7 +15,7 @@ It is designed for workloads that need both historical access and near-head real
 - Optional `customrpclist.json` support for appending your own RPC endpoints.
 - `.env` controls chain IDs, minimum block range, and health check interval.
 - Rejects stale RPCs that are too far behind the freshest observed head.
-- Requires `eth_getLogs` support above `10,000` blocks.
+- Requires `eth_getLogs` support for the configured `MIN_BLOCK_RANGE` (`1000` or greater).
 - Checks recent log ranges and historical archive access.
 - Round-robin load balancing across healthy RPCs.
 - Range-aware routing for large `eth_getLogs` requests.
@@ -113,21 +113,21 @@ Create `.env`:
 
 ```env
 CHAIN_IDS=56
-MIN_BLOCK_RANGE=10001
+MIN_BLOCK_RANGE=1000
 HEALTH_INTERVAL_MS=5000
 ```
 
 | Variable | Description |
 |---|---|
 | `CHAIN_IDS` | Comma-separated EVM chain IDs used to select Chainlist RPC lists. |
-| `MIN_BLOCK_RANGE` | Minimum accepted `eth_getLogs` range. Must be greater than `10000`. |
+| `MIN_BLOCK_RANGE` | Minimum accepted `eth_getLogs` range. Must be `1000` or greater. |
 | `HEALTH_INTERVAL_MS` | Health check interval in milliseconds. Defaults to `5000`. |
 
 Multi-chain example:
 
 ```env
 CHAIN_IDS=56,1,137,42161,8453,43114
-MIN_BLOCK_RANGE=10001
+MIN_BLOCK_RANGE=1000
 HEALTH_INTERVAL_MS=5000
 ```
 
@@ -291,7 +291,7 @@ Example health response:
   "healthyChainCount": 2,
   "config": {
     "chainIds": [1, 56],
-    "minBlockRange": 10001,
+    "minBlockRange": 1000,
     "healthIntervalMs": 5000
   },
   "chains": [

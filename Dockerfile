@@ -16,7 +16,6 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/relay-rpc /usr/local/bin/relay-rpc
-COPY .env.example /app/.env
 
 EXPOSE 8546
 
